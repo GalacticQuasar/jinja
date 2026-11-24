@@ -179,6 +179,123 @@ class TestMeta:
         x = meta.find_undeclared_variables(ast)
         assert x == {"foo"}
 
+    @pytest.mark.parametrize(
+        ("source", "expect"),
+        [
+            pytest.param(
+                "{% if control == 'something' %}\n"
+                "    {% set output = 1 %}\n"
+                "{% elif control == 'something else' %}\n"
+                "    {% set output = 2 %}\n"
+                "{% else %}\n"
+                "    {% set output = 3 %}\n"
+                "{% endif %}\n"
+                "{{ output }}\n",
+                {"control"},
+                id="issue-2069",
+            ),
+            pytest.param(
+                "{% if a %}{% set output = 1 %}"
+                "{% else %}{% set output = 2 %}{% endif %}{{ output }}",
+                {"a"},
+                id="if-else",
+            ),
+            pytest.param(
+                "{% if a %}{% set output = 1 %}"
+                "{% elif b %}{% set output = 2 %}"
+                "{% elif c %}{% set output = 3 %}"
+                "{% else %}{% set output = 4 %}{% endif %}{{ output }}",
+                {"a", "b", "c"},
+                id="multiple-elif",
+            ),
+            pytest.param(
+                "{% if a %}"
+                "{% if b %}{% set output = 1 %}"
+                "{% else %}{% set output = 2 %}{% endif %}"
+                "{% else %}{% set output = 3 %}{% endif %}{{ output }}",
+                {"a", "b"},
+                id="nested",
+            ),
+            pytest.param(
+                "{% for item in seq %}"
+                "{% if a %}{% set output = 1 %}"
+                "{% else %}{% set output = 2 %}{% endif %}{{ output }}"
+                "{% endfor %}",
+                {"seq", "a"},
+                id="for-body",
+            ),
+        ],
+    )
+    def test_find_undeclared_variables_set_all_branches(self, env, source, expect):
+        """A name set in every branch is not looked up from the context. #2069"""
+        assert meta.find_undeclared_variables(env.parse(source)) == expect
+
+    @pytest.mark.parametrize(
+        ("source", "expect"),
+        [
+            pytest.param(
+                "{% if a %}{% set output = 1 %}{% endif %}{{ output }}",
+                {"a", "output"},
+                id="no-else",
+            ),
+            pytest.param(
+                "{% if a %}{% set output = 1 %}"
+                "{% elif b %}{% set output = 2 %}{% endif %}{{ output }}",
+                {"a", "b", "output"},
+                id="elif-no-else",
+            ),
+            pytest.param(
+                "{% if a %}{% set output = 1 %}"
+                "{% elif b %}"
+                "{% elif c %}{% set output = 3 %}"
+                "{% else %}{% set output = 4 %}{% endif %}{{ output }}",
+                {"a", "b", "c", "output"},
+                id="middle-elif-missing",
+            ),
+            pytest.param(
+                "{% if a %}"
+                "{% if b %}{% set output = 1 %}{% endif %}"
+                "{% else %}{% set output = 2 %}{% endif %}{{ output }}",
+                {"a", "b", "output"},
+                id="nested-partial",
+            ),
+            pytest.param(
+                "{{ output }}{% if a %}{% set output = 1 %}"
+                "{% else %}{% set output = 2 %}{% endif %}{{ output }}",
+                {"a", "output"},
+                id="read-before-if",
+            ),
+            pytest.param(
+                "{% if a %}{% set output = output + 1 %}"
+                "{% else %}{% set output = 2 %}{% endif %}{{ output }}",
+                {"a", "output"},
+                id="read-before-set-in-branch",
+            ),
+            pytest.param(
+                "{% if a %}{% for item in seq %}{% set output = 1 %}{% endfor %}"
+                "{% else %}{% set output = 2 %}{% endif %}{{ output }}",
+                {"a", "seq", "output"},
+                id="set-in-loop-in-branch",
+            ),
+        ],
+    )
+    def test_find_undeclared_variables_set_some_branches(self, env, source, expect):
+        """A name that some path reads before setting it is still reported."""
+        assert meta.find_undeclared_variables(env.parse(source)) == expect
+
+    def test_set_in_branch_render_from_context(self, env):
+        """A path that does not set the name still reads it from the context."""
+        tmpl = env.from_string("{% if a %}{% set output = 1 %}{% endif %}{{ output }}")
+        assert tmpl.render(a=True, output="ctx") == "1"
+        assert tmpl.render(a=False, output="ctx") == "ctx"
+
+        tmpl = env.from_string(
+            "{{ output }}|{% if a %}{% set output = 1 %}"
+            "{% else %}{% set output = 2 %}{% endif %}{{ output }}"
+        )
+        assert tmpl.render(a=True, output="ctx") == "ctx|1"
+        assert tmpl.render(a=False, output="ctx") == "ctx|2"
+
     def test_find_refererenced_templates(self, env):
         ast = env.parse('{% extends "layout.html" %}{% include helper %}')
         i = meta.find_referenced_templates(ast)
