@@ -12,6 +12,29 @@ VAR_LOAD_ALIAS = "alias"
 VAR_LOAD_UNDEFINED = "undefined"
 
 
+def _find_loads(node: nodes.Node) -> t.Iterator[str]:
+    """Find the names that are loaded by a node and its children."""
+    for child in (node, *node.find_all((nodes.Name, nodes.NSRef))):
+        if isinstance(child, nodes.NSRef) or (
+            isinstance(child, nodes.Name) and child.ctx == "load"
+        ):
+            yield child.name
+
+
+def _find_functions(node: nodes.Node) -> t.Iterator[nodes.Node]:
+    """Find the nodes that are compiled to functions, which may be called after
+    the scope that defines them.
+    """
+    for child in (node, *node.find_all((nodes.Macro, nodes.CallBlock, nodes.For))):
+        if isinstance(child, (nodes.Macro, nodes.CallBlock)):
+            yield child
+        elif isinstance(child, nodes.For):
+            if child.recursive:
+                yield child
+            elif child.test is not None:
+                yield child.test
+
+
 def find_symbols(
     nodes: t.Iterable[nodes.Node], parent_symbols: t.Optional["Symbols"] = None
 ) -> "Symbols":
@@ -45,6 +68,20 @@ class Symbols:
         self.refs: t.Dict[str, str] = {}
         self.loads: t.Dict[str, t.Any] = {}
         self.stores: t.Set[str] = set()
+
+        # The rest is only used by `reads_context`, not to generate code. Except
+        # for `assigned`, it is shared by the copies made for branches.
+
+        # Names stored on every path up to the current node.
+        self.assigned: t.Set[str] = set()
+        # Names stored in all branches of an if.
+        self.covered: t.Set[str] = set()
+        # Names loaded while not assigned.
+        self.exposed: t.Set[str] = set()
+        # Nodes with an inner scope, and the names assigned at that point.
+        self.inner_scopes: t.List[t.Tuple[nodes.Node, t.Set[str]]] = []
+        # An overlay scope has no parent, but may be in a loop.
+        self.in_loop: bool = level > 0 if parent is None else parent.in_loop
 
     def analyze_node(self, node: nodes.Node, **kwargs: t.Any) -> None:
         visitor = RootVisitor(self)
@@ -92,10 +129,12 @@ class Symbols:
         rv.refs = self.refs.copy()
         rv.loads = self.loads.copy()
         rv.stores = self.stores.copy()
+        rv.assigned = self.assigned.copy()
         return rv
 
     def store(self, name: str) -> None:
         self.stores.add(name)
+        self.assigned.add(name)
 
         # If we have not see the name referenced yet, we need to figure
         # out what to set it to.
@@ -117,6 +156,9 @@ class Symbols:
         return self._define_ref(name, load=(VAR_LOAD_PARAMETER, None))
 
     def load(self, name: str) -> None:
+        if name not in self.assigned:
+            self.exposed.add(name)
+
         if self.find_ref(name) is None:
             self._define_ref(name, load=(VAR_LOAD_RESOLVE, name))
 
@@ -143,6 +185,26 @@ class Symbols:
                     self.loads[target] = (VAR_LOAD_ALIAS, outer_target)
                     continue
             self.loads[target] = (VAR_LOAD_RESOLVE, name)
+
+    def reads_context(self, name: str) -> bool:
+        """Check if the template may read the value that a name is resolved to.
+        It does not if all branches of an if store the name before it is read.
+        """
+        if name not in self.covered or name in self.exposed:
+            return True
+
+        for node, assigned in self.inner_scopes:
+            if name not in assigned and name in _find_loads(node):
+                return True
+
+            # In a loop, a function may be called in a later iteration, when the
+            # name is not assigned again yet.
+            if self.in_loop and any(
+                name in _find_loads(f) for f in _find_functions(node)
+            ):
+                return True
+
+        return False
 
     def dump_stores(self) -> t.Dict[str, str]:
         rv: t.Dict[str, str] = {}
@@ -203,6 +265,7 @@ class RootVisitor(NodeVisitor):
         self, node: nodes.For, for_branch: str = "body", **kwargs: t.Any
     ) -> None:
         if for_branch == "body":
+            self.sym_visitor.symbols.in_loop = True
             self.sym_visitor.visit(node.target, store_as_param=True)
             branch = node.body
         elif for_branch == "else":
@@ -235,6 +298,9 @@ class FrameSymbolVisitor(NodeVisitor):
     def __init__(self, symbols: "Symbols") -> None:
         self.symbols = symbols
 
+    def _add_inner_scope(self, node: nodes.Node) -> None:
+        self.symbols.inner_scopes.append((node, self.symbols.assigned.copy()))
+
     def visit_Name(
         self, node: nodes.Name, store_as_param: bool = False, **kwargs: t.Any
     ) -> None:
@@ -249,26 +315,35 @@ class FrameSymbolVisitor(NodeVisitor):
     def visit_NSRef(self, node: nodes.NSRef, **kwargs: t.Any) -> None:
         self.symbols.load(node.name)
 
-    def visit_If(self, node: nodes.If, **kwargs: t.Any) -> None:
+    def visit_If(self, node: nodes.If, **kwargs: t.Any) -> t.Set[str]:
+        """Returns the names assigned after the body, for use by the outer if
+        when visiting an elif.
+        """
         self.visit(node.test, **kwargs)
         original_symbols = self.symbols
 
-        def inner_visit(nodes: t.Iterable[nodes.Node]) -> "Symbols":
+        def inner_visit(
+            nodes: t.Iterable[nodes.Node],
+        ) -> t.Tuple["Symbols", t.List[t.Any]]:
             self.symbols = rv = original_symbols.copy()
-
-            for subnode in nodes:
-                self.visit(subnode, **kwargs)
-
+            results = [self.visit(subnode, **kwargs) for subnode in nodes]
             self.symbols = original_symbols
-            return rv
+            return rv, results
 
-        body_symbols = inner_visit(node.body)
-        elif_symbols = inner_visit(node.elif_)
-        else_symbols = inner_visit(node.else_ or ())
+        body_symbols, _ = inner_visit(node.body)
+        elif_symbols, elif_assigned = inner_visit(node.elif_)
+        else_symbols, _ = inner_visit(node.else_ or ())
         self.symbols.branch_update([body_symbols, elif_symbols, else_symbols])
+        assigned = body_symbols.assigned.intersection(
+            *elif_assigned, else_symbols.assigned
+        )
+        self.symbols.covered |= assigned - self.symbols.assigned
+        self.symbols.assigned = assigned
+        return body_symbols.assigned
 
     def visit_Macro(self, node: nodes.Macro, **kwargs: t.Any) -> None:
         self.symbols.store(node.name)
+        self._add_inner_scope(node)
 
     def visit_Import(self, node: nodes.Import, **kwargs: t.Any) -> None:
         self.generic_visit(node, **kwargs)
@@ -293,26 +368,34 @@ class FrameSymbolVisitor(NodeVisitor):
         is visited as part of the outer scope.
         """
         self.visit(node.iter, **kwargs)
+        self._add_inner_scope(node)
 
     def visit_CallBlock(self, node: nodes.CallBlock, **kwargs: t.Any) -> None:
         self.visit(node.call, **kwargs)
+        self._add_inner_scope(node)
 
     def visit_FilterBlock(self, node: nodes.FilterBlock, **kwargs: t.Any) -> None:
         self.visit(node.filter, **kwargs)
+        self._add_inner_scope(node)
 
     def visit_With(self, node: nodes.With, **kwargs: t.Any) -> None:
         for target in node.values:
             self.visit(target)
 
+        self._add_inner_scope(node)
+
     def visit_AssignBlock(self, node: nodes.AssignBlock, **kwargs: t.Any) -> None:
         """Stop visiting at block assigns."""
+        self._add_inner_scope(node)
         self.visit(node.target, **kwargs)
 
     def visit_Scope(self, node: nodes.Scope, **kwargs: t.Any) -> None:
         """Stop visiting at scopes."""
+        self._add_inner_scope(node)
 
     def visit_Block(self, node: nodes.Block, **kwargs: t.Any) -> None:
         """Stop visiting at blocks."""
 
     def visit_OverlayScope(self, node: nodes.OverlayScope, **kwargs: t.Any) -> None:
         """Do not visit into overlay scopes."""
+        self._add_inner_scope(node)

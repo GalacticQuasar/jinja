@@ -27,7 +27,11 @@ class TrackingCodeGenerator(CodeGenerator):
         super().enter_frame(frame)
 
         for _, (action, param) in frame.symbols.loads.items():
-            if action == "resolve" and param not in self.environment.globals:
+            if (
+                action == "resolve"
+                and param not in self.environment.globals
+                and frame.symbols.reads_context(param)
+            ):
                 self.undeclared_identifiers.add(param)
 
 
