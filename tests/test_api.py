@@ -11,12 +11,14 @@ from jinja2 import Environment
 from jinja2 import is_undefined
 from jinja2 import make_logging_undefined
 from jinja2 import meta
+from jinja2 import nodes
 from jinja2 import StrictUndefined
 from jinja2 import Template
 from jinja2 import TemplatesNotFound
 from jinja2 import Undefined
 from jinja2 import UndefinedError
 from jinja2.compiler import CodeGenerator
+from jinja2.ext import Extension
 from jinja2.runtime import Context
 from jinja2.utils import Cycler
 from jinja2.utils import pass_context
@@ -158,6 +160,16 @@ class TestExtendedAPI:
 
         with pytest.raises(OverflowError):
             t.render(total=MAX_RANGE + 1)
+
+
+class OverlayScopeExtension(Extension):
+    tags = {"overlay"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        context = parser.parse_expression()
+        body = parser.parse_statements(("name:endoverlay",), drop_needle=True)
+        return nodes.OverlayScope(context, body, lineno=lineno)
 
 
 class TestMeta:
@@ -328,6 +340,275 @@ class TestMeta:
         ast = env.parse('{% include ("foo.html", "bar.html", foo) %}')
         i = meta.find_referenced_templates(ast)
         assert list(i) == ["foo.html", "bar.html", None]
+
+
+class TestMetaSetInBranches:
+    """``find_undeclared_variables`` for a name that is set in an if."""
+
+    set_x = "{% if a %}{% set x = '1' %}{% else %}{% set x = '2' %}{% endif %}"
+
+    # Each reads x in a scope that is compiled separately from the if.
+    inner_scopes = {
+        "for": "{% for i in [1] %}{{ x }}{% endfor %}",
+        "for-else": "{% for i in [] %}{% else %}{{ x }}{% endfor %}",
+        "for-test": "{% for i in [1] if x %}{{ x }}{% endfor %}",
+        "for-recursive": "{% for i in [1] recursive %}{{ x }}{% endfor %}",
+        "with": "{% with %}{{ x }}{% endwith %}",
+        "macro": "{% macro m() %}{{ x }}{% endmacro %}{{ m() }}",
+        "macro-default": "{% macro m(y=x) %}{{ y }}{% endmacro %}{{ m() }}",
+        "call": "{% macro m() %}{{ caller() }}{% endmacro %}"
+        "{% call m() %}{{ x }}{% endcall %}",
+        "filter": "{% filter trim %}{{ x }}{% endfilter %}",
+        "set-block": "{% set y %}{{ x }}{% endset %}{{ y }}",
+        "autoescape": "{% autoescape true %}{{ x }}{% endautoescape %}",
+        "nested": "{% for i in [1] %}{% with %}{{ x }}{% endwith %}{% endfor %}",
+    }
+
+    # Each is a scope that contains the if.
+    bodies = {
+        "template": "%s",
+        "if": "{%% if true %%}%s{%% endif %%}",
+        "for": "{%% for i in [1] %%}%s{%% endfor %%}",
+        "for-else": "{%% for i in [] %%}{%% else %%}%s{%% endfor %%}",
+        "for-recursive": "{%% for i in [1] recursive %%}%s{%% endfor %%}",
+        "with": "{%% with %%}%s{%% endwith %%}",
+        "macro": "{%% macro m() %%}%s{%% endmacro %%}{{ m() }}",
+        "call": "{%% macro m() %%}{{ caller() }}{%% endmacro %%}"
+        "{%% call m() %%}%s{%% endcall %%}",
+        "filter": "{%% filter trim %%}%s{%% endfilter %%}",
+        "set-block": "{%% set y %%}%s{%% endset %%}{{ y }}",
+        "autoescape": "{%% autoescape true %%}%s{%% endautoescape %%}",
+        "block": "{%% block b %%}%s{%% endblock %%}",
+        "for-with": "{%% for i in [1] %%}{%% with %%}%s{%% endwith %%}{%% endfor %%}",
+    }
+
+    @pytest.fixture
+    def env(self):
+        return Environment(
+            extensions=["jinja2.ext.loopcontrols", OverlayScopeExtension]
+        )
+
+    @staticmethod
+    def is_reported(env, source):
+        return "x" in meta.find_undeclared_variables(env.parse(source))
+
+    @staticmethod
+    def render(env, source):
+        """Render for both values of a, with x in the context."""
+        tmpl = env.from_string(source)
+        return [tmpl.render(a=a, x="ctx") for a in (True, False)]
+
+    @pytest.mark.parametrize("position", range(4))
+    @pytest.mark.parametrize(
+        ("branch", "expect"),
+        [
+            pytest.param("", True, id="not-set"),
+            pytest.param("{{ x }}{% set x = 'n' %}", True, id="read-before-set"),
+            pytest.param(
+                "{% with %}{{ x }}{% endwith %}{% set x = 'n' %}",
+                True,
+                id="read-in-scope-before-set",
+            ),
+            pytest.param("{% set x = 'n' %}{{ x }}", False, id="read-after-set"),
+            pytest.param(
+                "{% set x = 'n' %}{% with %}{{ x }}{% endwith %}",
+                False,
+                id="read-in-scope-after-set",
+            ),
+        ],
+    )
+    def test_branch_position(self, env, position, branch, expect):
+        branches = ["{% set x = 's' %}"] * 4
+        branches[position] = branch
+        source = (
+            "{{% if n == 0 %}}{}{{% elif n == 1 %}}{}{{% elif n == 2 %}}{}"
+            "{{% else %}}{}{{% endif %}}[{{{{ x }}}}]"
+        ).format(*branches)
+        assert self.is_reported(env, source) is expect
+
+        tmpl = env.from_string(source)
+        for n in range(4):
+            result = tmpl.render(n=n, x="ctx")
+            assert ("ctx" in result) is (expect and n == position)
+            assert result.endswith("[s]") or n == position
+
+    @pytest.mark.parametrize("scope", inner_scopes)
+    def test_inner_scope_before(self, env, scope):
+        source = self.inner_scopes[scope] + self.set_x
+        assert self.is_reported(env, source)
+        assert self.render(env, source) == ["ctx", "ctx"]
+
+    @pytest.mark.parametrize("scope", inner_scopes)
+    def test_inner_scope_after(self, env, scope):
+        source = self.set_x + self.inner_scopes[scope]
+        assert not self.is_reported(env, source)
+        assert self.render(env, source) == ["1", "2"]
+
+    @pytest.mark.parametrize("body", bodies)
+    def test_body(self, env, body):
+        source = self.bodies[body] % (self.set_x + "{{ x }}")
+        assert not self.is_reported(env, source)
+        assert self.render(env, source) == ["1", "2"]
+
+    @pytest.mark.parametrize("body", bodies)
+    def test_body_read_before(self, env, body):
+        source = self.bodies[body] % ("{{ x }}" + self.set_x + "{{ x }}")
+        assert self.is_reported(env, source)
+        assert self.render(env, source) == ["ctx1", "ctx2"]
+
+    @pytest.mark.parametrize(
+        ("source", "expect"),
+        [
+            pytest.param("{% if x %}{% endif %}" + set_x, True, id="read-in-test"),
+            pytest.param(
+                "{% if a %}{% set x = 1 %}{% elif x %}{% set x = 2 %}"
+                "{% else %}{% set x = 3 %}{% endif %}",
+                True,
+                id="read-in-elif-test",
+            ),
+            pytest.param(
+                "{% if b %}{% set x = 1 %}{% endif %}{{ x }}" + set_x,
+                True,
+                id="read-after-partial",
+            ),
+            pytest.param(
+                "{% if b %}{% set x = 1 %}{% endif %}"
+                "{% with %}{{ x }}{% endwith %}" + set_x,
+                True,
+                id="read-in-scope-after-partial",
+            ),
+            pytest.param(
+                "{% with %}{% set x.y = 1 %}{% endwith %}" + set_x,
+                True,
+                id="namespace-attribute",
+            ),
+            pytest.param(
+                "{% for i in [1] %}{% set x = i %}{% endfor %}" + set_x,
+                False,
+                id="set-in-scope",
+            ),
+            pytest.param(
+                "{% if a %}{% set x %}{{ x }}{% endset %}"
+                "{% else %}{% set x = 2 %}{% endif %}",
+                True,
+                id="set-block-reads-itself",
+            ),
+            pytest.param(
+                "{% if a %}{% macro x() %}{{ x() }}{% endmacro %}"
+                "{% else %}{% macro x() %}{% endmacro %}{% endif %}",
+                False,
+                id="recursive-macro",
+            ),
+            pytest.param(
+                "{% overlay {'y': x} %}{% endoverlay %}" + set_x,
+                True,
+                id="overlay-context",
+            ),
+            pytest.param(
+                "{% if a %}{% set x = 1 %}{{ x }}{% endif %}", True, id="partial"
+            ),
+            pytest.param(
+                "{% if a %}{% set x = 1 %}{% if b %}{% endif %}{{ x }}{% endif %}",
+                True,
+                id="partial-around-if",
+            ),
+            pytest.param(
+                "{% for i in [1] %}"
+                + set_x
+                + "{% for j in [1] if x %}{% endfor %}{% endfor %}",
+                True,
+                id="for-test-in-loop",
+            ),
+        ],
+    )
+    def test_read(self, env, source, expect):
+        assert self.is_reported(env, source) is expect
+
+    @pytest.mark.parametrize("body", ["template", "macro"])
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "{% include 't' ignore missing %}",
+            "{% import 't' as t with context %}",
+            "{% from 't' import t with context %}",
+            "{% block t %}{% endblock %}",
+            "{% block t scoped %}{% endblock %}",
+        ],
+    )
+    def test_other_template(self, env, body, source):
+        """Only reads by the template itself are considered."""
+        assert not self.is_reported(env, self.bodies[body] % (source + self.set_x))
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "%s",
+            "{%% with %%}%s{%% endwith %%}",
+            "{%% overlay {} %%}%s{%% endoverlay %%}",
+        ],
+        ids=["for", "for-with", "for-overlay"],
+    )
+    @pytest.mark.parametrize(
+        "wrap",
+        ["%s", "{%% with %%}%s{%% endwith %%}", "{%% for j in [1] %%}%s{%% endfor %%}"],
+        ids=["plain", "with", "for"],
+    )
+    @pytest.mark.parametrize(
+        ("define", "call"),
+        [
+            pytest.param(
+                "{% macro m() %}{{ x }}{% endmacro %}{{ keep(m) }}",
+                "{{ f() }}",
+                id="macro",
+            ),
+            pytest.param(
+                "{% macro m() %}{{ keep(caller) }}{% endmacro %}"
+                "{% call m() %}{{ x }}{% endcall %}",
+                "{{ f() }}",
+                id="call",
+            ),
+            pytest.param(
+                "{% for j in [1] recursive %}{{ x }}{{ keep(loop) }}{% endfor %}",
+                "{{ f([1]) }}",
+                id="for-recursive",
+            ),
+            pytest.param(
+                "{% for j in [1, 'ctx'] if j != x %}"
+                "{{ keep(loop) }}{% break %}{% endfor %}",
+                "{{ 'ctx' if f.nextitem is undefined }}",
+                id="for-test",
+            ),
+        ],
+    )
+    def test_function_kept_in_loop(self, env, body, wrap, define, call):
+        """A function from the previous iteration is called before the if."""
+        call = "{% for f in kept[:1] %}" + call + "{% endfor %}"
+        body = body % (call + self.set_x + wrap % define)
+        source = "{% for i in [1, 2] %}" + body + "{% endfor %}"
+        assert self.is_reported(env, source)
+
+        kept = []
+        result = env.from_string(source).render(
+            a=True, x="ctx", kept=kept, keep=lambda f: kept.append(f) or ""
+        )
+        assert "ctx" in result
+
+    @pytest.mark.parametrize(
+        "scope",
+        [
+            pytest.param("{% with %}{{ x }}{% endwith %}", id="with"),
+            pytest.param("{% for j in [1] %}{{ x }}{% endfor %}", id="for"),
+            pytest.param("{% for j in [1] if j %}{{ x }}{% endfor %}", id="for-test"),
+            pytest.param(
+                "{% with %}{{ x }}{% macro m() %}{{ y }}{% endmacro %}{% endwith %}",
+                id="unrelated-macro",
+            ),
+        ],
+    )
+    def test_no_function_in_loop(self, env, scope):
+        """A read that isn't in a function can't be delayed."""
+        source = "{% for i in [1] %}" + self.set_x + scope + "{% endfor %}"
+        assert not self.is_reported(env, source)
 
 
 class TestStreaming:
